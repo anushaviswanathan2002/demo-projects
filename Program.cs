@@ -1,4 +1,4 @@
-using CounterApp;
+using DemoProjects;
 
 var counter = new Counter();
 bool running = true;

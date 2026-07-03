@@ -1,4 +1,4 @@
-namespace CounterApp;
+namespace DemoProjects;
 
 public class Counter
 {
