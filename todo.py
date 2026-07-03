@@ -1,132 +1,184 @@
-import json
-import os
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich import box
+from tinydb import TinyDB, Query
+from pydantic import BaseModel, field_validator
 from datetime import datetime
+from typing import Optional
 
-DATA_FILE = "todos.json"
-
-
-def load_todos() -> list[dict]:
-    if not os.path.exists(DATA_FILE):
-        return []
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_todos(todos: list[dict]) -> None:
-    with open(DATA_FILE, "w") as f:
-        json.dump(todos, f, indent=2)
+app = typer.Typer(
+    name="todo",
+    help="A simple CLI Todo App powered by Typer, Rich, TinyDB & Pydantic.",
+    add_completion=False,
+)
+console = Console()
+db = TinyDB("todos.json")
+todos_table = db.table("todos")
+TodoQuery = Query()
 
 
-def add_todo(title: str) -> dict:
-    todos = load_todos()
-    todo = {
-        "id": (max((t["id"] for t in todos), default=0) + 1),
-        "title": title,
-        "done": False,
-        "created_at": datetime.now().isoformat(),
-    }
-    todos.append(todo)
-    save_todos(todos)
-    return todo
+# ---------------------------------------------------------------------------
+# Pydantic model
+# ---------------------------------------------------------------------------
+
+class TodoItem(BaseModel):
+    id: int
+    title: str
+    priority: str = "medium"
+    done: bool = False
+    created_at: str = ""
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
+        allowed = {"low", "medium", "high"}
+        if v.lower() not in allowed:
+            raise ValueError(f"Priority must be one of: {', '.join(allowed)}")
+        return v.lower()
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Title cannot be empty.")
+        return v
 
 
-def list_todos(show_all: bool = True) -> list[dict]:
-    todos = load_todos()
-    if not show_all:
-        todos = [t for t in todos if not t["done"]]
-    return todos
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _next_id() -> int:
+    all_records = todos_table.all()
+    return max((r["id"] for r in all_records), default=0) + 1
 
 
-def complete_todo(todo_id: int) -> bool:
-    todos = load_todos()
-    for todo in todos:
-        if todo["id"] == todo_id:
-            todo["done"] = True
-            save_todos(todos)
-            return True
-    return False
+PRIORITY_COLOR = {"high": "red", "medium": "yellow", "low": "green"}
+PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
 
-def delete_todo(todo_id: int) -> bool:
-    todos = load_todos()
-    updated = [t for t in todos if t["id"] != todo_id]
-    if len(updated) == len(todos):
-        return False
-    save_todos(updated)
-    return True
+def _build_table(todos: list[dict], title: str) -> Table:
+    table = Table(
+        title=title,
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        show_lines=True,
+    )
+    table.add_column("ID", style="bold", justify="center", width=4)
+    table.add_column("Title", min_width=24)
+    table.add_column("Priority", justify="center", width=10)
+    table.add_column("Status", justify="center", width=10)
+    table.add_column("Created At", justify="center", width=20)
+
+    for t in todos:
+        priority = t.get("priority", "medium")
+        color = PRIORITY_COLOR.get(priority, "white")
+        emoji = PRIORITY_EMOJI.get(priority, "")
+        status = "[green]✓ Done[/green]" if t["done"] else "[yellow]○ Pending[/yellow]"
+        table.add_row(
+            str(t["id"]),
+            t["title"],
+            f"[{color}]{emoji} {priority.capitalize()}[/{color}]",
+            status,
+            t.get("created_at", "—"),
+        )
+    return table
 
 
-def print_todos(todos: list[dict]) -> None:
-    if not todos:
-        print("  No todos found.")
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+@app.command("add")
+def add(
+    title: str = typer.Argument(..., help="Title of the todo item."),
+    priority: str = typer.Option("medium", "--priority", "-p", help="Priority: low | medium | high"),
+):
+    """Add a new todo item."""
+    try:
+        item = TodoItem(
+            id=_next_id(),
+            title=title,
+            priority=priority,
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    todos_table.insert(item.model_dump())
+    console.print(
+        f"[green]✓ Added:[/green] [bold]#{item.id}[/bold] — {item.title} "
+        f"([{PRIORITY_COLOR[item.priority]}]{item.priority}[/{PRIORITY_COLOR[item.priority]}])"
+    )
+
+
+@app.command("list")
+def list_todos(
+    all_todos: bool = typer.Option(True, "--all/--pending", help="Show all or only pending todos."),
+):
+    """List todo items."""
+    records = todos_table.all()
+    if not all_todos:
+        records = [r for r in records if not r["done"]]
+
+    if not records:
+        console.print("[dim]No todos found.[/dim]")
         return
-    for todo in todos:
-        status = "✓" if todo["done"] else "○"
-        print(f"  [{status}] #{todo['id']} — {todo['title']}")
+
+    label = "All Todos" if all_todos else "Pending Todos"
+    console.print(_build_table(records, label))
 
 
-def print_menu() -> None:
-    print("\n=== Todo App ===")
-    print("  1. List all todos")
-    print("  2. List pending todos")
-    print("  3. Add todo")
-    print("  4. Complete todo")
-    print("  5. Delete todo")
-    print("  0. Exit")
+@app.command("done")
+def complete(
+    todo_id: int = typer.Argument(..., help="ID of the todo to mark as complete."),
+):
+    """Mark a todo as complete."""
+    updated = todos_table.update({"done": True}, TodoQuery.id == todo_id)
+    if not updated:
+        console.print(f"[red]Todo #{todo_id} not found.[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]✓ Marked #{todo_id} as done.[/green]")
 
 
-def main() -> None:
-    while True:
-        print_menu()
-        choice = input("\nChoice: ").strip()
+@app.command("delete")
+def delete(
+    todo_id: int = typer.Argument(..., help="ID of the todo to delete."),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt."),
+):
+    """Delete a todo item."""
+    record = todos_table.get(TodoQuery.id == todo_id)
+    if not record:
+        console.print(f"[red]Todo #{todo_id} not found.[/red]")
+        raise typer.Exit(code=1)
 
-        if choice == "1":
-            todos = list_todos(show_all=True)
-            print()
-            print_todos(todos)
+    if not force:
+        confirm = typer.confirm(f"Delete todo #{todo_id} — \"{record['title']}\"?")
+        if not confirm:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit()
 
-        elif choice == "2":
-            todos = list_todos(show_all=False)
-            print()
-            print_todos(todos)
+    todos_table.remove(TodoQuery.id == todo_id)
+    console.print(f"[red]✗ Deleted #{todo_id}.[/red]")
 
-        elif choice == "3":
-            title = input("Todo title: ").strip()
-            if not title:
-                print("  Title cannot be empty.")
-                continue
-            todo = add_todo(title)
-            print(f"  Added: #{todo['id']} — {todo['title']}")
 
-        elif choice == "4":
-            try:
-                todo_id = int(input("Todo ID to complete: ").strip())
-            except ValueError:
-                print("  Invalid ID.")
-                continue
-            if complete_todo(todo_id):
-                print(f"  Marked #{todo_id} as done.")
-            else:
-                print(f"  Todo #{todo_id} not found.")
+@app.command("clear")
+def clear(
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt."),
+):
+    """Delete all completed todos."""
+    if not force:
+        confirm = typer.confirm("Delete all completed todos?")
+        if not confirm:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit()
 
-        elif choice == "5":
-            try:
-                todo_id = int(input("Todo ID to delete: ").strip())
-            except ValueError:
-                print("  Invalid ID.")
-                continue
-            if delete_todo(todo_id):
-                print(f"  Deleted #{todo_id}.")
-            else:
-                print(f"  Todo #{todo_id} not found.")
-
-        elif choice == "0":
-            print("  Goodbye!")
-            break
-
-        else:
-            print("  Invalid choice. Please try again.")
+    todos_table.remove(TodoQuery.done == True)  # noqa: E712
+    console.print("[green]✓ Cleared all completed todos.[/green]")
 
 
 if __name__ == "__main__":
-    main()
+    app()
